@@ -1,0 +1,19 @@
+# Convenience wrapper around the root Dockerfile. The daemon alone is enough:
+#   docker build -t kronos-nestor:local .
+#   docker run -d -p 8787:8787 -v kronos-data:/data kronos-nestor:local
+services:
+  kronos:
+    build: .
+    image: kronos-nestor:local
+    container_name: kronos-nestor
+    ports:
+      - "8787:8787"
+    volumes:
+      - kronos-data:/data
+    restart: unless-stopped
+    environment:
+      KRONOS_BIND_HOST: "0.0.0.0"
+      HF_HUB_OFFLINE: "1"
+
+volumes:
+  kronos-data:

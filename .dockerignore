@@ -1,0 +1,16 @@
+.git
+.gitignore
+**/__pycache__
+__pycache__
+*.pyc
+*.pyo
+._*
+**/.DS_Store
+.DS_Store
+*.log
+data/
+scripts/__pycache__
+figures/
+webui/
+finetune_csv/
+tests/
