@@ -95,7 +95,10 @@ KLINE_LIMIT = 401  # one extra so dropping the still-forming bar leaves 400
 KLINE_BASE = "https://api.binance.com/api/v3/klines"
 ALL_COLS_FOR_INFER = ["open", "high", "low", "close", "volume", "amount"]
 
-BRACKET_GRID = [[0.5, 0.25], [1.0, 0.5], [1.5, 0.75], [2.0, 1.0], [2.0, 2.0], [3.0, 1.5]]
+# Bracket grid: P(+upPct before -downPct) per path, keyed "up/down" percent
+# strings (e.g. "1.0/0.5"). Denser grid on the up side because entry-gate
+# signals carry ~2:1 R:R targets.
+BRACKET_GRID = [[u, d] for u in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0) for d in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candles (
