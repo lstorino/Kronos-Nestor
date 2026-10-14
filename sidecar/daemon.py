@@ -2,12 +2,19 @@
 """Nestor Kronos shadow-forecaster sidecar daemon (SHADOW MODE: no trading).
 
 Every 15 minutes, aligned to the UTC :00/:15/:30/:45 bar close +45s, for each of
-the 5 symbols it:
+the crypto symbols (Binance, default BTCUSDT/ETHUSDT/SOLUSDT/XRPUSDT/DOGEUSDT)
+it:
   1. fetches the last 401 15m klines from Binance (public, keyless),
   2. upserts them into the `candles` table (INSERT OR REPLACE on symbol+open_time_ms),
   3. runs Kronos-small with 50 sampled paths (pred_len=16, T=1.0, top_p=0.9,
      lookback 400 closed bars) and stores horizon stats, bracket probabilities,
      and the raw [50,16,6] paths blob into the `forecasts` table.
+
+On the same cycle it also covers the US symbols (Yahoo Finance, default
+NVDA/AAPL/QQQ/SPY): fetches ~60d of 15m bars (keyless Yahoo chart v8), upserts
+them into `candles`, and runs the same model only when Yahoo's newest closed
+bar is newer than the newest bar already forecast for that symbol (progress
+gate — never burn inference when nothing new closed).
 
 A read-only HTTP server (sidecar/server.py) runs in a thread on 127.0.0.1:8787.
 
@@ -53,6 +60,7 @@ from model.kronos import (  # noqa: E402
     sample_from_logits,
 )
 from pathwalk import walk_paths  # noqa: E402
+from yahoo import fetch_yahoo_bars  # noqa: E402
 
 # --- load the sibling server module by path (no package install, no sys.path games)
 _spec = importlib.util.spec_from_file_location(
@@ -63,7 +71,12 @@ _spec.loader.exec_module(server_mod)
 
 log = logging.getLogger("sidecar")
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+def _env_symbols(name, default):
+    return [s.strip() for s in os.environ.get(name, default).split(",") if s.strip()]
+
+
+SYMBOLS = _env_symbols("KRONOS_BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT")
+YAHOO_SYMBOLS = _env_symbols("KRONOS_YAHOO_SYMBOLS", "NVDA,AAPL,QQQ,SPY")
 DATA_DIR = REPO_ROOT / "data"
 # The SQLite DB must NOT live on the exFAT SSD: SQLite's file journal cannot be
 # rewritten there (every journal mode that writes a -journal file fails on the
@@ -94,6 +107,13 @@ TOP_P = 0.9
 KLINE_LIMIT = 401  # one extra so dropping the still-forming bar leaves 400
 KLINE_BASE = "https://api.binance.com/api/v3/klines"
 ALL_COLS_FOR_INFER = ["open", "high", "low", "close", "volume", "amount"]
+
+# US stocks: inference needs the full 400-bar lookback; 60d of Yahoo 15m bars
+# yields 1000+, so anything below 400 means the fetch was truncated.
+MIN_STOCK_BARS = 400
+# If a cycle is already this many seconds old when stock work starts, defer the
+# remaining stock symbols to the next cycle (NAS compute envelope protection).
+STOCK_DEFER_AFTER_S = float(os.environ.get("KRONOS_STOCK_DEFER_AFTER_S", "600"))
 
 # Bracket grid: P(+upPct before -downPct) per path, keyed "up/down" percent
 # strings (e.g. "1.0/0.5"). Denser grid on the up side because entry-gate
@@ -325,6 +345,18 @@ def insert_forecast(conn, symbol, bar_time, last_close, horizons, brackets, path
     conn.commit()
 
 
+def latest_forecast_bar_ms(conn, symbol):
+    """Newest forecasted bar OPEN time (ms) for a symbol, or None if never
+    forecast. Drives the stock progress gate: only run Kronos for a US symbol
+    when Yahoo has a closed bar newer than the last one forecast."""
+    row = conn.execute(
+        "SELECT MAX(bar_time) FROM forecasts WHERE symbol=?", (symbol,)
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(datetime.fromisoformat(row[0]).timestamp() * 1000)
+
+
 def push_forecasts(payloads):
     """POST the just-captured forecasts to the Nestor internal endpoint
     (POST /api/internal/kronos-forecast). Best-effort by contract: failures are
@@ -361,6 +393,42 @@ def next_wake(after):
     return floored + timedelta(minutes=30, seconds=45)
 
 
+def infer_symbol(predictor, conn, sym, closed, source, payloads):
+    """Run Kronos on a closed-bar frame, store the forecast, append the push
+    payload. `source` is "binance" or "yahoo" (log line + provenance)."""
+    t0 = time.perf_counter()
+    try:
+        x_timestamp = pd.to_datetime(closed["open_time_ms"], unit="ms")
+        y_timestamp = pd.Series(pd.date_range(
+            start=x_timestamp.iloc[-1] + pd.Timedelta(minutes=15),
+            periods=PRED_LEN, freq="15min",
+        ))
+        paths = sample_paths(predictor, closed[ALL_COLS_FOR_INFER], x_timestamp,
+                             y_timestamp, PRED_LEN, T_TEMP, TOP_P, N_SAMPLES)
+        last_close = float(closed["close"].iloc[-1])
+        bar_time = datetime.fromtimestamp(int(closed["open_time_ms"].iloc[-1]) / 1000, tz=timezone.utc).isoformat()
+        horizons = horizon_stats(paths, last_close)
+        brackets = bracket_probs(paths, last_close)
+        insert_forecast(conn, sym, bar_time, last_close, horizons, brackets, paths)
+        payloads.append({
+            "symbol": sym,
+            "barTime": bar_time,
+            "lastClose": last_close,
+            "predLen": PRED_LEN,
+            "nPaths": N_SAMPLES,
+            "model": MODEL_NAME,
+            "horizonsJson": horizons,
+            "bracketsJson": brackets,
+        })
+        log.info("%s forecast ok bar=%s last_close=%.4f infer=%.1fs source=%s",
+                 sym, bar_time, last_close, time.perf_counter() - t0, source)
+    except Exception:
+        log.exception("%s: inference failed this cycle (source=%s)", sym, source)
+    finally:
+        if predictor.device == "mps":
+            torch.mps.empty_cache()
+
+
 def run_cycle(predictor, conn, wake_dt):
     boundary_dt = wake_dt - timedelta(minutes=15, seconds=45)  # just-closed bar open time
     boundary_ms = int(boundary_dt.timestamp() * 1000)
@@ -379,45 +447,46 @@ def run_cycle(predictor, conn, wake_dt):
             log.error("%s: only %d closed bars at boundary %s, skipping", sym, len(closed), boundary_dt)
             continue
         fetched[sym] = closed
+
+    # US stocks piggyback on the same UTC-quarter cycle. Per-symbol progress
+    # gate: only spend inference when Yahoo's newest CLOSED bar is newer than
+    # the newest bar we have forecast for that symbol.
+    stocks = {}
+    for sym in YAHOO_SYMBOLS:
+        if time.perf_counter() - t_cycle > STOCK_DEFER_AFTER_S:
+            log.warning("cycle over budget; deferring remaining stock work to next cycle")
+            break
+        try:
+            df = fetch_yahoo_bars(sym)
+        except Exception:
+            log.exception("%s: yahoo fetch failed this cycle", sym)
+            continue
+        upsert_candles(conn, sym, df)
+        newest_ms = int(df["open_time_ms"].iloc[-1])
+        last_ms = latest_forecast_bar_ms(conn, sym)
+        if last_ms is not None and newest_ms <= last_ms:
+            log.info("%s: no new closed bar (newest=%d last_forecast=%d), skipping inference",
+                     sym, newest_ms, last_ms)
+            continue
+        if len(df) < MIN_STOCK_BARS:
+            log.error("%s: only %d closed bars from Yahoo, need %d, skipping", sym, len(df), MIN_STOCK_BARS)
+            continue
+        # Same 400-bar inference window as the Binance path; the full history
+        # stays in `candles` for the future fine-tuning dataset.
+        stocks[sym] = df.tail(MIN_STOCK_BARS)
     fetch_s = time.perf_counter() - t_fetch
 
     t_infer = time.perf_counter()
     payloads = []
     for sym, closed in fetched.items():
-        t0 = time.perf_counter()
-        try:
-            x_timestamp = pd.to_datetime(closed["open_time_ms"], unit="ms")
-            y_timestamp = pd.Series(pd.date_range(
-                start=x_timestamp.iloc[-1] + pd.Timedelta(minutes=15),
-                periods=PRED_LEN, freq="15min",
-            ))
-            paths = sample_paths(predictor, closed[ALL_COLS_FOR_INFER], x_timestamp,
-                                 y_timestamp, PRED_LEN, T_TEMP, TOP_P, N_SAMPLES)
-            last_close = float(closed["close"].iloc[-1])
-            bar_time = datetime.fromtimestamp(int(closed["open_time_ms"].iloc[-1]) / 1000, tz=timezone.utc).isoformat()
-            horizons = horizon_stats(paths, last_close)
-            brackets = bracket_probs(paths, last_close)
-            insert_forecast(conn, sym, bar_time, last_close, horizons, brackets, paths)
-            payloads.append({
-                "symbol": sym,
-                "barTime": bar_time,
-                "lastClose": last_close,
-                "predLen": PRED_LEN,
-                "nPaths": N_SAMPLES,
-                "model": MODEL_NAME,
-                "horizonsJson": horizons,
-                "bracketsJson": brackets,
-            })
-            log.info("%s forecast ok bar=%s last_close=%.4f infer=%.1fs", sym, bar_time, last_close, time.perf_counter() - t0)
-        except Exception:
-            log.exception("%s: inference failed this cycle", sym)
-        finally:
-            if predictor.device == "mps":
-                torch.mps.empty_cache()
+        infer_symbol(predictor, conn, sym, closed, "binance", payloads)
+    for sym, closed in stocks.items():
+        infer_symbol(predictor, conn, sym, closed, "yahoo", payloads)
     infer_s = time.perf_counter() - t_infer
     total_s = time.perf_counter() - t_cycle
-    log.info("cycle boundary=%s fetched=%d/5 symbols fetch=%.1fs infer=%.1fs total=%.1fs",
-             boundary_dt.isoformat(), len(fetched), fetch_s, infer_s, total_s)
+    log.info("cycle boundary=%s crypto=%d/%d stocks=%d/%d fetch=%.1fs infer=%.1fs total=%.1fs",
+             boundary_dt.isoformat(), len(fetched), len(SYMBOLS),
+             len(stocks), len(YAHOO_SYMBOLS), fetch_s, infer_s, total_s)
     try:
         push_forecasts(payloads)
     except Exception:
@@ -435,8 +504,8 @@ def main():
     )
     logging.Formatter.converter = time.gmtime  # UTC log timestamps
     bind_host = os.environ.get("KRONOS_BIND_HOST", "127.0.0.1")
-    log.info("starting: symbols=%s model=%s n_samples=%d pred_len=%d host=%s port=%d db=%s",
-             SYMBOLS, MODEL_NAME, N_SAMPLES, PRED_LEN, bind_host, HTTP_PORT, DB_PATH)
+    log.info("starting: crypto=%s stocks=%s model=%s n_samples=%d pred_len=%d host=%s port=%d db=%s",
+             SYMBOLS, YAHOO_SYMBOLS, MODEL_NAME, N_SAMPLES, PRED_LEN, bind_host, HTTP_PORT, DB_PATH)
 
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -456,7 +525,7 @@ def main():
         log.info("--once done, exiting")
         return
 
-    state = {"last_cycle": None, "n_symbols": len(SYMBOLS)}
+    state = {"last_cycle": None, "n_symbols": len(SYMBOLS) + len(YAHOO_SYMBOLS)}
     server_mod.start_server(DB_PATH, state, host=bind_host, port=HTTP_PORT)
 
     while True:

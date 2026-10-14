@@ -1,16 +1,24 @@
 # Kronos shadow-forecaster sidecar
 
 SHADOW MODE data capture: every 15 minutes (UTC bar close +45s) it forecasts
-BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT with Kronos-small (50 sampled
-paths, pred_len=16, T=1.0, top_p=0.9, 400×15m lookback), stores raw candles
-(future fine-tuning dataset) and forecast distributions in SQLite. Zero trading
-influence.
+BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT (Binance) and NVDA, AAPL, QQQ,
+SPY (Yahoo Finance) with Kronos-small (50 sampled paths, pred_len=16, T=1.0,
+top_p=0.9, 400×15m lookback), stores raw candles (future fine-tuning dataset)
+and forecast distributions in SQLite. Zero trading influence.
+
+The crypto symbols run every cycle. The US symbols piggyback on the same
+cycle but only run inference when a new closed 15m bar exists (progress gate
+against the newest forecast bar per symbol) — US bars close at :30/:45/:00/:15
+ET, so the UTC-quarter cycle sometimes sees them at cycle start, sometimes
+mid-cycle; a 1-cycle delay is fine (the consumer reads latest-by-symbol).
 
 ## Files
 
 - `daemon.py` — scheduler + capture + inference + DB writer; loads the model once
 - `server.py` — read-only HTTP API (runs as a thread inside the daemon)
 - `pathwalk.py` — shared first-touch path-walking math (daemon + server)
+- `yahoo.py` — keyless Yahoo chart v8 fetcher for US symbols (same internal
+  bar shape as the Binance path; `amount` approximated as close × volume)
 
 ## Run modes
 
@@ -52,7 +60,7 @@ Manager) — no cross-build needed; the Dockerfile is architecture-neutral
 
 ## HTTP API (read-only)
 
-- `GET /health` → `{"ok": true, "last_cycle": "<iso>", "symbols": 5}`
+- `GET /health` → `{"ok": true, "last_cycle": "<iso>", "symbols": 9}` (crypto + US total)
 - `GET /latest?symbol=BTCUSDT` → newest forecast row (horizons + brackets,
   `paths_blob` omitted); `GET /latest` → all symbols.
 - `POST /query` — first-touch probabilities of caller-supplied stop/target
@@ -75,6 +83,9 @@ malformed body → 400.
 
 | var | default | notes |
 |---|---|---|
+| `KRONOS_BINANCE_SYMBOLS` | `BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT` | comma-separated crypto symbols (Binance klines) |
+| `KRONOS_YAHOO_SYMBOLS` | `NVDA,AAPL,QQQ,SPY` | comma-separated US symbols (Yahoo 15m bars) |
+| `KRONOS_STOCK_DEFER_AFTER_S` | `600` | defer remaining stock work to the next cycle when the cycle is already this many seconds old (compute-envelope guard) |
 | `KRONOS_DB_PATH` | `~/.local/share/nestor-kronos/kronos.db` (Mac) / `/data/kronos.db` (image) | SQLite location — keep on a journaling filesystem |
 | `KRONOS_BIND_HOST` | `127.0.0.1` (`0.0.0.0` in the image) | HTTP bind host |
 | `HF_HUB_OFFLINE` | unset (`1` in the image) | set after first model download |
