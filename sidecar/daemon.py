@@ -18,11 +18,13 @@ gate — never burn inference when nothing new closed).
 
 A read-only HTTP server (sidecar/server.py) runs in a thread on 127.0.0.1:8787.
 
-If KRONOS_PUSH_URL and KRONOS_PUSH_TOKEN are set, each cycle also pushes the
+If KRONOS_PUSH_URL and KRONOS_PUSH_TOKEN are set, each cycle pushes the
 just-captured forecasts to the Nestor internal endpoint (POST
-/api/internal/kronos-forecast, x-internal-token). Best-effort: push failures
-are logged and never affect capture; the server upserts on (symbol, barTime)
-so re-pushes are idempotent.
+/api/internal/kronos-forecast, x-internal-token). Crypto is pushed as a batch
+before stock inference starts; each stock is pushed immediately after its own
+inference so slow later symbols cannot delay finished forecasts. Best-effort:
+push failures are logged and never affect capture; the server upserts on
+(symbol, barTime) so re-pushes are idempotent.
 
 Run: python sidecar/daemon.py            (normal, launchd-managed)
      python sidecar/daemon.py --once      (single immediate cycle; for smoke tests)
@@ -477,20 +479,25 @@ def run_cycle(predictor, conn, wake_dt):
     fetch_s = time.perf_counter() - t_fetch
 
     t_infer = time.perf_counter()
-    payloads = []
+    crypto_payloads = []
     for sym, closed in fetched.items():
-        infer_symbol(predictor, conn, sym, closed, "binance", payloads)
+        infer_symbol(predictor, conn, sym, closed, "binance", crypto_payloads)
+    try:
+        push_forecasts(crypto_payloads)
+    except Exception:
+        log.exception("crypto push step crashed (ignored; capture unaffected)")
     for sym, closed in stocks.items():
-        infer_symbol(predictor, conn, sym, closed, "yahoo", payloads)
+        stock_payloads = []
+        infer_symbol(predictor, conn, sym, closed, "yahoo", stock_payloads)
+        try:
+            push_forecasts(stock_payloads)
+        except Exception:
+            log.exception("%s push step crashed (ignored; capture unaffected)", sym)
     infer_s = time.perf_counter() - t_infer
     total_s = time.perf_counter() - t_cycle
     log.info("cycle boundary=%s crypto=%d/%d stocks=%d/%d fetch=%.1fs infer=%.1fs total=%.1fs",
              boundary_dt.isoformat(), len(fetched), len(SYMBOLS),
              len(stocks), len(YAHOO_SYMBOLS), fetch_s, infer_s, total_s)
-    try:
-        push_forecasts(payloads)
-    except Exception:
-        log.exception("push step crashed (ignored; capture unaffected)")
     return datetime.now(timezone.utc).isoformat()
 
 

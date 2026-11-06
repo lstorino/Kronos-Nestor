@@ -89,7 +89,7 @@ malformed body → 400.
 | `KRONOS_DB_PATH` | `~/.local/share/nestor-kronos/kronos.db` (Mac) / `/data/kronos.db` (image) | SQLite location — keep on a journaling filesystem |
 | `KRONOS_BIND_HOST` | `127.0.0.1` (`0.0.0.0` in the image) | HTTP bind host |
 | `HF_HUB_OFFLINE` | unset (`1` in the image) | set after first model download |
-| `KRONOS_PUSH_URL` / `KRONOS_PUSH_TOKEN` | unset (push disabled) | POST captured forecasts to the Nestor internal endpoint after each cycle |
+| `KRONOS_PUSH_URL` / `KRONOS_PUSH_TOKEN` | unset (push disabled) | POST captured forecasts to the Nestor internal endpoint: crypto as a batch before stock inference, then each stock immediately after inference |
 
 ## Performance (measured)
 
