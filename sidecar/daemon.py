@@ -79,6 +79,39 @@ def _env_symbols(name, default):
 
 SYMBOLS = _env_symbols("KRONOS_BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT")
 YAHOO_SYMBOLS = _env_symbols("KRONOS_YAHOO_SYMBOLS", "NVDA,AAPL,QQQ,SPY")
+
+
+def refresh_forecast_universe():
+    push_url = os.environ.get("KRONOS_PUSH_URL", "")
+    token = os.environ.get("KRONOS_PUSH_TOKEN", "")
+    url = os.environ.get(
+        "KRONOS_FORECAST_UNIVERSE_URL",
+        push_url.replace("/api/internal/kronos-forecast", "/api/internal/forecast-universe"),
+    )
+    if not url or not token:
+        return
+    req = urllib.request.Request(url, headers={"x-internal-token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        rows = payload.get("symbols", [])
+        crypto = list(dict.fromkeys(
+            row["symbol"] for row in rows
+            if row.get("assetClass") == "crypto" and isinstance(row.get("symbol"), str)
+        ))
+        stocks = list(dict.fromkeys(
+            row["symbol"] for row in rows
+            if row.get("assetClass") in ("stocks", "etfs") and isinstance(row.get("symbol"), str)
+        ))
+        if not crypto and not stocks:
+            raise ValueError("forecast universe is empty")
+        SYMBOLS[:] = crypto
+        YAHOO_SYMBOLS[:] = stocks
+        log.info("forecast universe refreshed: crypto=%d stocks=%d", len(SYMBOLS), len(YAHOO_SYMBOLS))
+    except Exception as exc:
+        log.warning("forecast universe refresh failed; keeping previous symbols: %s", exc)
+
+
 DATA_DIR = REPO_ROOT / "data"
 # The SQLite DB must NOT live on the exFAT SSD: SQLite's file journal cannot be
 # rewritten there (every journal mode that writes a -journal file fails on the
@@ -432,6 +465,7 @@ def infer_symbol(predictor, conn, sym, closed, source, payloads):
 
 
 def run_cycle(predictor, conn, wake_dt):
+    refresh_forecast_universe()
     boundary_dt = wake_dt - timedelta(minutes=15, seconds=45)  # just-closed bar open time
     boundary_ms = int(boundary_dt.timestamp() * 1000)
     t_cycle = time.perf_counter()
@@ -542,6 +576,7 @@ def main():
         time.sleep(max(0.0, (wake - now).total_seconds()))
         try:
             state["last_cycle"] = run_cycle(predictor, conn, wake)
+            state["n_symbols"] = len(SYMBOLS) + len(YAHOO_SYMBOLS)
         except Exception:
             log.exception("cycle failed; continuing to next boundary")
             state["last_cycle"] = datetime.now(timezone.utc).isoformat()

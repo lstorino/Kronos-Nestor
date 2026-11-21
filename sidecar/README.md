@@ -1,10 +1,12 @@
 # Kronos shadow-forecaster sidecar
 
-SHADOW MODE data capture: every 15 minutes (UTC bar close +45s) it forecasts
-BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT (Binance) and NVDA, AAPL, QQQ,
-SPY (Yahoo Finance) with Kronos-small (50 sampled paths, pred_len=16, T=1.0,
-top_p=0.9, 400×15m lookback), stores raw candles (future fine-tuning dataset)
-and forecast distributions in SQLite. Zero trading influence.
+Data capture runs every 15 minutes (UTC bar close +45s) for Nestor's active
+watchlist and observing recruitment candidates. Each cycle refreshes that
+universe from the authenticated internal endpoint; on failure it keeps the
+previous symbol lists. Binance covers crypto and Yahoo Finance covers US
+instruments. Kronos uses 50 sampled paths, pred_len=16, T=1.0, top_p=0.9, and a
+400×15m lookback, then stores raw candles and forecast distributions in SQLite.
+The sidecar has no execution route or broker credentials.
 
 The crypto symbols run every cycle. The US symbols piggyback on the same
 cycle but only run inference when a new closed 15m bar exists (progress gate
@@ -60,7 +62,7 @@ Manager) — no cross-build needed; the Dockerfile is architecture-neutral
 
 ## HTTP API (read-only)
 
-- `GET /health` → `{"ok": true, "last_cycle": "<iso>", "symbols": 9}` (crypto + US total)
+- `GET /health` → `{"ok": true, "last_cycle": "<iso>", "symbols": <dynamic total>}` (watchlist + recruitment)
 - `GET /latest?symbol=BTCUSDT` → newest forecast row (horizons + brackets,
   `paths_blob` omitted); `GET /latest` → all symbols.
 - `POST /query` — first-touch probabilities of caller-supplied stop/target
@@ -83,8 +85,9 @@ malformed body → 400.
 
 | var | default | notes |
 |---|---|---|
-| `KRONOS_BINANCE_SYMBOLS` | `BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT` | comma-separated crypto symbols (Binance klines) |
-| `KRONOS_YAHOO_SYMBOLS` | `NVDA,AAPL,QQQ,SPY` | comma-separated US symbols (Yahoo 15m bars) |
+| `KRONOS_BINANCE_SYMBOLS` | `BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT` | fallback crypto symbols when the universe endpoint is unavailable |
+| `KRONOS_YAHOO_SYMBOLS` | `NVDA,AAPL,QQQ,SPY` | fallback US symbols when the universe endpoint is unavailable |
+| `KRONOS_FORECAST_UNIVERSE_URL` | derived from `KRONOS_PUSH_URL` | authenticated watchlist + recruitment universe refresh each cycle |
 | `KRONOS_STOCK_DEFER_AFTER_S` | `600` | defer remaining stock work to the next cycle when the cycle is already this many seconds old (compute-envelope guard) |
 | `KRONOS_DB_PATH` | `~/.local/share/nestor-kronos/kronos.db` (Mac) / `/data/kronos.db` (image) | SQLite location — keep on a journaling filesystem |
 | `KRONOS_BIND_HOST` | `127.0.0.1` (`0.0.0.0` in the image) | HTTP bind host |

@@ -1,3 +1,6 @@
+import io
+import json
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -34,6 +37,7 @@ class SidecarDeliveryTests(unittest.TestCase):
             patch.object(daemon, "latest_forecast_bar_ms", return_value=None),
             patch.object(daemon, "infer_symbol", side_effect=infer),
             patch.object(daemon, "push_forecasts", side_effect=push),
+            patch.object(daemon, "refresh_forecast_universe"),
         ):
             daemon.run_cycle(None, None, wake)
 
@@ -46,6 +50,29 @@ class SidecarDeliveryTests(unittest.TestCase):
                 ("push", ["QQQ"]),
             ],
         )
+
+    def test_refresh_forecast_universe_includes_watchlist_and_recruitment(self):
+        payload = {
+            "symbols": [
+                {"symbol": "BTCUSDT", "assetClass": "crypto", "source": "watchlist"},
+                {"symbol": "ADAUSDT", "assetClass": "crypto", "source": "recruitment"},
+                {"symbol": "QQQ", "assetClass": "etfs", "source": "watchlist"},
+                {"symbol": "AMD", "assetClass": "stocks", "source": "recruitment"},
+            ]
+        }
+        with (
+            patch.dict(os.environ, {
+                "KRONOS_PUSH_URL": "https://nestor.example/api/internal/kronos-forecast",
+                "KRONOS_PUSH_TOKEN": "test-token",
+            }),
+            patch.object(daemon.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())) as request,
+            patch.object(daemon, "SYMBOLS", ["OLDUSDT"]),
+            patch.object(daemon, "YAHOO_SYMBOLS", ["OLD"]),
+        ):
+            daemon.refresh_forecast_universe()
+            self.assertEqual(daemon.SYMBOLS, ["BTCUSDT", "ADAUSDT"])
+            self.assertEqual(daemon.YAHOO_SYMBOLS, ["QQQ", "AMD"])
+            request.assert_called_once()
 
 
 if __name__ == "__main__":
