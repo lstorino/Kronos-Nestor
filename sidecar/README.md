@@ -106,3 +106,14 @@ Bind to LAN/Tailscale only — **never port-forward this to the public
 internet**. The VPS (Nestor) reaches this service over Tailscale or a reverse
 tunnel (e.g. `ssh -R`). The API is unauthenticated read-only forecast data, but
 it still maps your internal network topology.
+
+
+## Tests
+
+Use Python 3.12 and the pinned NumPy version to match the production-compatible pandas build:
+
+```bash
+uv venv /tmp/kronos-venv312 --python 3.12
+uv pip install --python /tmp/kronos-venv312/bin/python -r requirements-dev.txt
+/tmp/kronos-venv312/bin/python -m pytest -q tests
+```
